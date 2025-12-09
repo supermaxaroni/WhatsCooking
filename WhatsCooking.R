@@ -1,91 +1,149 @@
-# ============================================================
-# Load libraries
-# ============================================================
 library(tidyverse)
-library(tidytext)
 library(tidymodels)
-library(jsonlite)
-library(glmnet)
 library(textrecipes)
+library(jsonlite)
+library(stacks)
+library(xgboost)
+library(discrim)
+library(doParallel)
 
-# ============================================================
-# Load JSON Files
-# ============================================================
-trainSet <- read_file("./train.json") %>% fromJSON()
-testSet  <- read_file("./test.json") %>% fromJSON()
+# ===============================================
+# Helper functions
+# ===============================================
+clean_text <- function(x) {
+  x %>%
+    tolower() %>%
+    str_replace_all("[0-9]", " ") %>%
+    str_replace_all("[[:punct:]]", " ") %>%
+    str_replace_all("\\s+", " ") %>%
+    str_trim()
+}
 
-# ============================================================
-# Unnest ingredients
-# ============================================================
-train_long <- trainSet %>%
-  unnest(ingredients)
+clean_ingredient_vector <- function(ing_vec) {
+  ing_vec %>%
+    map_chr(clean_text)
+}
 
-test_long <- testSet %>%
-  unnest(ingredients)
+# ===============================================
+# Load data
+# ===============================================
+train_raw <- read_json("train.json", simplifyVector = TRUE)
+test_raw  <- read_json("test.json", simplifyVector = TRUE)
 
-# ============================================================
-# Collapse ingredients into a single text string per recipe
-# ============================================================
-train_doc <- train_long %>%
-  group_by(id, cuisine) %>%
-  summarise(
-    text = paste(ingredients, collapse = " "),
-    .groups = "drop"
+# ===============================================
+# Clean ingredients text
+# ===============================================
+train_raw <- train_raw %>%
+  mutate(
+    ingredients_text = map_chr(
+      ingredients, ~ paste(clean_ingredient_vector(.x), collapse = " ")
+    )
   )
 
-test_doc <- test_long %>%
-  group_by(id) %>%
-  summarise(
-    text = paste(ingredients, collapse = " "),
-    .groups = "drop"
+test_raw <- test_raw %>%
+  mutate(
+    ingredients_text = map_chr(
+      ingredients, ~ paste(clean_ingredient_vector(.x), collapse = " ")
+    )
   )
 
-# ============================================================
-# Create recipe: tokenize → filter → tf-idf
-# ============================================================
-recipe_cuisine <- recipe(cuisine ~ text, data = train_doc) %>%
-  step_tokenize(text) %>%
-  step_tokenfilter(text, max_tokens = 3000) %>%   # limit vocabulary
-  step_tfidf(text)
+write_csv(test_raw, "test_new.csv")
+write_csv(train_raw, "train_new.csv")
 
-# ============================================================
-# Model: Regularized multinomial logistic regression (glmnet)
-# ============================================================
-model_spec <- multinom_reg(
-  penalty = 0.01,
-  mixture = 1
-) %>% 
+# ===============================================
+# Split training (initial_split)
+# ===============================================
+set.seed(123)
+split <- initial_split(train_raw, prop = 0.9, strata = cuisine)
+
+train <- training(split)
+valid <- testing(split)
+
+# ===============================================
+# Text recipe (smaller token limit)
+# ===============================================
+rec <- recipe(cuisine ~ ingredients_text, data = train) %>%
+  step_tokenize(ingredients_text) %>%
+  step_tokenfilter(ingredients_text, max_tokens = 2000) %>%
+  step_tfidf(ingredients_text)
+
+# ===============================================
+# Models for ensemble
+# ===============================================
+glmnet_spec <- multinom_reg(penalty = tune(), mixture = 1) %>%
   set_engine("glmnet")
 
-# ============================================================
-# Workflow
-# ============================================================
-workflow_cuisine <- workflow() %>%
-  add_recipe(recipe_cuisine) %>%
-  add_model(model_spec)
+nb_spec <- naive_Bayes(smoothness = tune()) %>%
+  set_engine("naivebayes")
 
-# ============================================================
-# Fit model
-# ============================================================
-fit_cuisine <- workflow_cuisine %>%
-  fit(data = train_doc)
+xgb_spec <- boost_tree(
+  trees = tune(),
+  learn_rate = tune(),
+  mtry = tune(),
+  tree_depth = tune()
+) %>% set_engine("xgboost") %>% set_mode("classification")
 
-# ============================================================
-# Predict on test set
-# ============================================================
-test_predictions <- predict(fit_cuisine, new_data = test_doc)
+# ===============================================
+# Workflows
+# ===============================================
+wf_glmnet <- workflow() %>% add_recipe(rec) %>% add_model(glmnet_spec)
+wf_nb     <- workflow() %>% add_recipe(rec) %>% add_model(nb_spec)
+wf_xgb    <- workflow() %>% add_recipe(rec) %>% add_model(xgb_spec)
 
-# ============================================================
-# Create Kaggle submission file
-# ============================================================
-submission <- test_doc %>%
-  bind_cols(test_predictions) %>%
-  select(id, .pred_class) %>%
-  rename(cuisine = .pred_class)
+# ===============================================
+# Parallel backend
+# ===============================================
+cl <- makeCluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+
+# ===============================================
+# Tune with small grids
+# ===============================================
+glmnet_res <- tune_grid(
+  wf_glmnet,
+  resamples = vfold_cv(train, v = 2, strata = cuisine),
+  grid = 1
+)
+
+nb_res <- tune_grid(
+  wf_nb,
+  resamples = vfold_cv(train, v = 2, strata = cuisine),
+  grid = 1
+)
+
+xgb_res <- tune_grid(
+  wf_xgb,
+  resamples = vfold_cv(train, v = 2, strata = cuisine),
+  grid = 2
+)
+
+# ===============================================
+# Stacking ensemble
+# ===============================================
+model_stack <- stacks() %>%
+  add_candidates(glmnet_res) %>%
+  add_candidates(nb_res) %>%
+  add_candidates(xgb_res) %>%
+  blend_predictions() %>%
+  fit_members()
+
+# ===============================================
+# Final fit on all training data
+# ===============================================
+final_fit <- fit(model_stack, data = train_raw)
+
+# ===============================================
+# Predict on test
+# ===============================================
+test_preds <- predict(final_fit, test_raw)
+
+submission <- tibble(
+  id = test_raw$id,
+  cuisine = test_preds$.pred_class
+)
 
 write_csv(submission, "submission.csv")
+cat("submission.csv created!\n")
 
-# ============================================================
-# Message
-# ============================================================
-cat("submission.csv created successfully!\n")
+# Stop cluster
+stopCluster(cl)
